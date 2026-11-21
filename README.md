@@ -16,10 +16,10 @@ Runtime ForceSubs untuk ekosistem **ZΞI Project**.
 ## Yang ditangani runtime ini
 
 - Pengaturan channel database dan tujuan ForceSubs.
-- Pembuatan link konten serta batch.
+- Pembuatan link konten serta batch, melalui chat bot atau kiriman langsung ke channel database. Edit konten DB dipakai pada pengambilan berikutnya.
 - Pemeriksaan keanggotaan dan tombol Coba Lagi.
 - Pengiriman konten dan penghapusan terjadwal.
-- Pengaturan pemilik serta akses pembuatan link untuk admin.
+- Pengaturan bot oleh pemilik dan admin, dengan nama admin yang terhubung ke profil Telegram.
 
 `zei_forcesubs/child_ui.py` memiliki antarmuka bot anak. `zei_forcesubs/service.py` memiliki pengiriman konten, pemeriksaan akses, dan cleanup.
 
