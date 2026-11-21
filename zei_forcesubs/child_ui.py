@@ -11,7 +11,7 @@ BATCH_BUTTONS = [[button('✓ Selesai', 'b:done'), button('✕ Batal', 'x:cancel
 PROMPTS = {
  'database': ('Pilih ruang penyimpananmu 🗂️', 'Kirim <b>ID channel database</b> yang ingin digunakan.\nPastikan bot sudah menjadi admin dengan izin mengirim dan menghapus pesan, ya.'),
  'add_target': ('Atur gerbang aksesmu 🔐', 'Kirim <b>ID channel atau grup</b> yang wajib diikuti pengguna.\nPastikan bot sudah menjadi admin dengan izin mengundang pengguna, ya.'),
- 'add_admin': ('Tambah pengelola konten 👤', 'Kirim <b>ID Telegram pengguna</b> yang ingin dijadikan admin.\nAdmin hanya bisa membuat link satu konten dan batch.'),
+ 'add_admin': ('Tambah pengelola konten 👤', 'Kirim <b>ID Telegram pengguna</b> yang ingin dijadikan admin.\nAdmin bisa mengelola pengaturan, konten, daftar admin, dan broadcast bot ini.'),
  'remove_admin': ('Hapus akses admin 🔐', 'Kirim <b>ID Telegram admin</b> yang ingin dihapus.'),
  'welcome': ('Sambut pengguna dengan gayamu ✨', 'Kirim teks yang ingin ditampilkan saat pengguna membuka bot.\nMaksimal <b>1.000 karakter</b>, ya.'),
  'welcome_photo': ('Beri sentuhan pada botmu 🖼️', 'Kirim foto yang ingin ditampilkan bersama pesan sambutan.\nKirim sebagai <b>foto</b>, bukan dokumen, ya.'),
@@ -27,6 +27,48 @@ class ChildUI(BaseUI):
         self.bot = bot
         self.delivery = Delivery(db, bot, api)
         self.broadcasting = False
+
+
+    async def handle(self, update):
+        message = update.get('channel_post') or update.get('edited_channel_post')
+        if message is None:
+            return await super().handle(update)
+        chat = message.get('chat', {})
+        if chat.get('type') != 'channel' or chat.get('id') != self.db.settings(self.bot)['database']:
+            return
+        if not (message.get('text', '').strip() or any(key in message for key in FILES)):
+            return
+        source, ident = chat['id'], message['message_id']
+        metadata = None
+        if message.get('photo'):
+            metadata = {'type': 'photo', 'media': message['photo'][-1]['file_id']}
+        elif message.get('video'):
+            metadata = {'type': 'video', 'media': message['video']['file_id']}
+        if metadata:
+            for key in ('caption', 'caption_entities'):
+                if key in message:
+                    metadata[key] = message[key]
+            if message.get('has_media_spoiler'):
+                metadata['has_spoiler'] = True
+            self.db.content(self.bot, source, ident, metadata)
+        else:
+            with self.db.conn:
+                self.db.conn.execute('DELETE FROM content WHERE bot=? AND chat=? AND message_id=?',
+                                     (self.bot, source, ident))
+        if 'edited_channel_post' in update or message.get('from', {}).get('is_bot'):
+            return
+        import json
+        sources = [(source, ident)]
+        previous = self.db.rows('SELECT key FROM links WHERE bot=? AND sources=?',
+                                (self.bot, json.dumps(sources)))
+        if previous:
+            return
+        key = self.db.link(self.bot, self.db.bot(self.bot)['owner'], sources)
+        link = f'https://t.me/{self.db.bot(self.bot)["username"]}?start={key}'
+        await self.api.call('sendMessage', chat_id=source,
+            text=panel('Kontenmu siap dibagikan 🔗', 'Link berhasil dibuat.\n\n'+h(link)),
+            parse_mode='HTML', reply_parameters={'message_id': ident},
+            reply_markup={'inline_keyboard': [[copy_button(link)]]})
 
     def expiry_buttons(self, state):
         return [[button('↻ Mulai Lagi', state.get('back', 's:home')), button('⌂ Menu Utama', 's:home')]]
@@ -52,11 +94,11 @@ class ChildUI(BaseUI):
     async def welcome(self, user):
         s = self.db.settings(self.bot)
         text = s['welcome'].replace('{nama_bot}', await self.name()).replace('{nama_pengguna}', self.names.get(user, 'teman'))
-        buttons = SETTINGS if user == self.db.bot(self.bot)['owner'] else []
+        buttons = SETTINGS if self.db.can_manage(self.bot, user) else []
         await self.photo_text(user, (s['welcome_photo'] or {}).get('file_id'), pretty(text), buttons)
 
     async def settings_menu(self, user):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         self.clear(user)
         s = self.db.settings(self.bot)
         database = str(s['database'] or 'Belum diatur')
@@ -83,7 +125,7 @@ class ChildUI(BaseUI):
           f'<b>Hapus otomatis:</b> {minutes(s["delete_seconds"])}\n\nPilih bagian yang ingin kamu ubah.'), buttons)
 
     async def targets_menu(self, user):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         self.clear(user)
         targets = self.db.targets(self.bot)
         buttons = [[button('＋ Tambah Channel/Group', 's:add_target')]] if len(targets) < 4 else []
@@ -92,11 +134,11 @@ class ChildUI(BaseUI):
           f'Slot terpakai: <b>{len(targets)}/4</b>.\nSemua channel/grup dalam daftar wajib diikuti.'), buttons+SETTINGS)
 
     async def admins_menu(self, user, page=0):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         self.clear(user)
         admins = self.db.admins(self.bot)
         page = max(0, min(page, max(0, (len(admins)-1)//20)))
-        listed = ', '.join(str(a) for a in admins[page*20:(page+1)*20]) or 'Belum ada admin tambahan.'
+        listed = '\n'.join([await self.admin_identity(a) for a in admins[page*20:(page+1)*20]]) or 'Belum ada admin tambahan.'
         buttons = [[button('＋ Tambah ID Admin', 's:add_admin'), button('🗑️ Hapus ID Admin', 's:remove_admin')]]
         pages = []
         if page:
@@ -105,10 +147,20 @@ class ChildUI(BaseUI):
             pages.append(button('Berikutnya ›', f's:admins:{page+1}'))
         if pages:
             buttons.append(pages)
-        await self.text(user, panel('Pengelola kontenmu 👤', listed+'\n\nAdmin hanya dapat membuat link.'), buttons+SETTINGS)
+        await self.text(user, panel('Pengelola botmu 👤', listed+'\n\nAdmin dapat mengelola pengaturan, konten, dan broadcast bot ini.'), buttons+SETTINGS)
+
+    async def admin_identity(self, user):
+        profile = self.db.telegram_profile(user)
+        try:
+            sender = await self.api.call('getChat', chat_id=user)
+            if isinstance(sender, dict) and sender.get('id') == user:
+                profile = self.db.telegram_profile(user, sender)
+        except TelegramFailure:
+            pass
+        return f'<a href="tg://user?id={user}">{h(profile.get("name") or "Pengguna Telegram")}</a>'
 
     async def prompt(self, user, key):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         back = ('s:targets' if key == 'add_target' else 's:admins' if key in ('add_admin', 'remove_admin')
                 else 's:deletion' if key == 'delete_seconds' else 's:menu')
         if key == 'add_target' and len(self.db.targets(self.bot)) >= 4:
@@ -124,7 +176,7 @@ class ChildUI(BaseUI):
         await self.text(user, panel(title, body), buttons+nav('s:back'))
 
     async def protection_menu(self, user):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         self.clear(user)
         active = self.db.settings(self.bot)['protection']
         await self.text(user, panel('Atur perlindungan kontenmu 🔐',
@@ -134,7 +186,7 @@ class ChildUI(BaseUI):
            [button('‹ Kembali', 's:menu')]])
 
     async def deletion_menu(self, user):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         self.clear(user)
         await self.text(user, panel('Atur waktu kontenmu ⏳',
           f'Durasi saat ini: <b>{minutes(self.db.settings(self.bot)["delete_seconds"])}</b>\n\n'
@@ -153,7 +205,7 @@ class ChildUI(BaseUI):
         await self.text(user, text, [[button('‹ Hapus Otomatis', 's:deletion')], *SETTINGS])
 
     async def begin_broadcast(self, user):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         if self.broadcasting:
             raise ValueError('Broadcast sebelumnya masih berlangsung.')
         self.wait(user, 'broadcast', back='s:broadcast')
@@ -162,7 +214,7 @@ class ChildUI(BaseUI):
           [[button('✕ Batal', 'x:cancel')]])
 
     async def confirm_broadcast(self, user, message_id):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         if self.broadcasting:
             raise ValueError('Broadcast sebelumnya masih berlangsung.')
         nonce = secrets.token_hex(4)
@@ -183,7 +235,7 @@ class ChildUI(BaseUI):
             return await self.finish_batch(user)
         if data == 'b:start':
             return await self.begin_batch(user)
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         if data == 's:back':
             state = self.state(user)
             back = state.get('back', 's:menu') if state else 's:menu'
@@ -223,7 +275,7 @@ class ChildUI(BaseUI):
             self.db.admin(self.bot, user, target, False)
             self.clear(user)
             return await self.text(user, panel('Akses admin diperbarui ✅',
-              f'Pengguna dengan ID <b>{target}</b> tidak lagi bisa membuat link di botmu.'),
+              f'Pengguna dengan ID <b>{target}</b> tidak lagi bisa mengelola botmu.'),
               [[button('‹ Daftar Admin', 's:admins')], *SETTINGS])
         if data == 's:protection':
             return await self.protection_menu(user)
@@ -284,9 +336,9 @@ class ChildUI(BaseUI):
             return await self.delivery.deliver(user, arg) if arg else await self.welcome(user)
         if cmd == '/help':
             return await self.text(user, panel('Panduan singkat ✨',
-              'Buka link konten untuk mengambil isinya.\nPemilik/admin: kirim teks atau file, atau gunakan /batch.\nPemilik: /setting dan /broadcast.'))
+              'Buka link konten untuk mengambil isinya.\nPemilik/admin: kirim teks atau file, atau gunakan /batch.\nPemilik/admin: /setting dan /broadcast.'))
         if cmd == '/broadcast':
-            self.db.owner(self.bot, user)
+            self.db.manage(self.bot, user)
             if message.get('reply_to_message'):
                 return await self.confirm_broadcast(user, message['reply_to_message']['message_id'])
             return await self.begin_broadcast(user)
@@ -310,7 +362,7 @@ class ChildUI(BaseUI):
         if not source:
             return await self.text(user, panel('Penyimpanan belum siap 🗂️',
               'Pemilik perlu mengatur channel database melalui pengaturan terlebih dahulu.'),
-              SETTINGS if user == self.db.bot(self.bot)['owner'] else None)
+              SETTINGS if self.db.can_manage(self.bot, user) else None)
         await self.delivery.validate_chat(source, database=True)
         saved = await self.api.call('copyMessage', chat_id=source, from_chat_id=user, message_id=message['message_id'])
         metadata = None
@@ -334,7 +386,7 @@ class ChildUI(BaseUI):
         return await self.share(user, [pair])
 
     async def apply_setting(self, user, message, key):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         state = self.state(user)
         try:
             result = await self.save_setting(user, message, key)
@@ -363,7 +415,7 @@ class ChildUI(BaseUI):
               f'Pengguna wajib bergabung sebelum mengambil konten.\n\nSlot terpakai: <b>{count}/4</b>.'), buttons)
         if key == 'add_admin':
             return await self.text(user, panel('Admin berhasil ditambahkan ✅',
-              f'Pengguna dengan ID <b>{result}</b> sekarang bisa membuat link di botmu.'),
+              f'{await self.admin_identity(result)} sekarang bisa mengelola botmu.'),
               [[button('‹ Daftar Admin', 's:admins')], *SETTINGS])
         if key == 'delete_seconds':
             return await self.duration_saved(user, result)
@@ -394,13 +446,17 @@ class ChildUI(BaseUI):
         elif key in ('add_admin', 'remove_admin'):
             target = self.positive_id(text)
             if key == 'add_admin':
+                profile = await self.api.call('getChat', chat_id=target)
+                if not isinstance(profile, dict) or profile.get('id') != target or profile.get('type') != 'private':
+                    raise ValueError('Pengguna perlu membuka bot dan menekan Start terlebih dahulu.')
+                self.db.telegram_profile(target, profile)
                 self.db.admin(self.bot, user, target, True)
                 return target
             if target not in self.db.admins(self.bot):
                 raise ValueError('ID tersebut tidak terdaftar sebagai admin tambahan.')
             self.wait(user, 'remove_admin', target=target, back='s:admins')
             await self.text(user, panel('Hapus akses admin? 🔐',
-              f'Pengguna dengan ID <b>{target}</b> tidak lagi bisa membuat link di botmu.\nLink yang sudah dibuat tetap tersedia.'),
+              f'Pengguna dengan ID <b>{target}</b> tidak lagi bisa mengelola botmu.\nLink yang sudah dibuat tetap tersedia.'),
               [[button('🗑️ Hapus Admin', f's:remove_admin_yes:{target}'), button('‹ Kembali', 's:admins')]])
         elif key == 'welcome_photo':
             if not message.get('photo'):
@@ -439,7 +495,7 @@ class ChildUI(BaseUI):
         await self.durable(user, panel(title, body+'\n\n'+h(link)), [[copy_button(link)]])
 
     async def broadcast(self, user, message_id):
-        self.db.owner(self.bot, user)
+        self.db.manage(self.bot, user)
         if self.broadcasting:
             raise ValueError('Broadcast sebelumnya masih berlangsung.')
         self.broadcasting = True
